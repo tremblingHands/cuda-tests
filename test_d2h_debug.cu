@@ -4,9 +4,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <streambuf>
+#include <string>
 
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PAGE_SHIFT 12
@@ -130,9 +134,49 @@ static const StageInfo kStages[] = {
 struct Config {
     float dataSizeGB = 1.0f;
     int numIterations = 10;
-    bool interactive = false;   // -i: pause after every stage
+    bool interactive = false;    // -i: pause after every stage
     bool showHostLayout = false; // -H: print host VA/PA layout (va2pa)
+    bool captureDmesg = false;   // -d: embed incremental dmesg at stage boundaries
+    const char* outputPath = nullptr; // -o: tee merged log to file
 };
+
+class TeeStreambuf : public std::streambuf {
+public:
+    TeeStreambuf(std::streambuf* primary, std::streambuf* secondary)
+        : outPrimary(primary), outSecondary(secondary)
+    {
+    }
+
+protected:
+    int overflow(int c) override
+    {
+        if (c == traits_type::eof()) {
+            return traits_type::not_eof(c);
+        }
+
+        if (outPrimary->sputc(static_cast<char>(c)) == traits_type::eof()) {
+            return traits_type::eof();
+        }
+        if (outSecondary->sputc(static_cast<char>(c)) == traits_type::eof()) {
+            return traits_type::eof();
+        }
+        return c;
+    }
+
+    int sync() override
+    {
+        outPrimary->pubsync();
+        outSecondary->pubsync();
+        return 0;
+    }
+
+private:
+    std::streambuf* outPrimary;
+    std::streambuf* outSecondary;
+};
+
+static size_t g_dmesg_line_offset = 0;
+static const char* g_last_stage_name = "start";
 
 static uint64_t va2pa(uint64_t va)
 {
@@ -168,6 +212,86 @@ static uint64_t va2pa(uint64_t va)
     return (pfn << PAGE_SHIFT) | (va & (PAGE_SIZE - 1));
 }
 
+static void printUserTimestamp()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        std::cout << "[USER-TIME] (unavailable)\n";
+        return;
+    }
+
+    struct tm localTm;
+    localtime_r(&ts.tv_sec, &localTm);
+
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &localTm);
+    std::cout << "[USER-TIME] " << buf << "."
+              << (ts.tv_nsec / 1000000) << "\n";
+}
+
+static size_t countDmesgLines(FILE* fp)
+{
+    size_t lines = 0;
+    char buf[8192];
+
+    while (fgets(buf, sizeof(buf), fp) != nullptr) {
+        ++lines;
+    }
+    return lines;
+}
+
+static FILE* openDmesgPipe()
+{
+    FILE* fp = popen("dmesg -T 2>/dev/null", "r");
+    if (fp != nullptr) {
+        return fp;
+    }
+    return popen("dmesg 2>/dev/null", "r");
+}
+
+static void initDmesgCapture()
+{
+    FILE* fp = openDmesgPipe();
+    if (fp == nullptr) {
+        std::cerr << "[DMESG] warning: failed to run dmesg at startup "
+                     "(try: sudo ./test_d2h_debug ...)\n";
+        g_dmesg_line_offset = 0;
+        return;
+    }
+
+    g_dmesg_line_offset = countDmesgLines(fp);
+    pclose(fp);
+    std::cout << "[DMESG] baseline set to " << g_dmesg_line_offset
+              << " existing kernel log line(s); new lines captured per stage\n";
+}
+
+static void dumpDmesgDelta()
+{
+    FILE* fp = openDmesgPipe();
+    if (fp == nullptr) {
+        std::cerr << "[DMESG] failed to run dmesg (need root/CAP_SYSLOG?)\n";
+        return;
+    }
+
+    std::cout << "[DMESG:since_" << g_last_stage_name << "]\n";
+
+    size_t line = 0;
+    size_t printed = 0;
+    char buf[8192];
+    while (fgets(buf, sizeof(buf), fp) != nullptr) {
+        ++line;
+        if (line > g_dmesg_line_offset) {
+            std::cout << buf;
+            ++printed;
+        }
+    }
+
+    pclose(fp);
+    g_dmesg_line_offset = line;
+
+    std::cout << "[DMESG:end] " << printed << " new line(s)\n";
+}
+
 static void printUsage(const char* programName)
 {
     std::cout <<
@@ -176,19 +300,23 @@ static void printUsage(const char* programName)
         "  -s <GB>     Data size in GB (default: 1.0)\n"
         "  -n <count>  Timed D2H iterations (default: 10)\n"
         "  -i          Interactive: pause after every stage (default: no pause)\n"
+        "  -d          Capture full dmesg delta at each stage boundary\n"
+        "  -o <file>   Tee merged user+dmesg output to file (works with -d)\n"
         "  -H          Print host VA/PA layout via /proc/self/pagemap (default: off)\n"
         "  -h          Show this help\n\n"
-        "Stages (paused when -i is set):\n";
+        "Stages (boundaries printed when -i or -d is set):\n";
     for (const StageInfo& stage : kStages) {
         std::cout << "  " << stage.name << " : " << stage.title << "\n";
     }
     std::cout <<
         "\nExamples:\n"
-        "  " << programName << " -i              # step through all stages\n"
-        "  " << programName << " -H -i           # include host_layout stage\n"
-        "  " << programName << " -s 0.5 -n 1     # run without pauses\n\n"
-        "Tip: in another terminal run:\n"
-        "  sudo dmesg -w | grep D2H-TRACE\n";
+        "  " << programName << " -i -d\n"
+        "      # step through stages; dmesg merged inline (run with sudo)\n"
+        "  " << programName << " -d -o merged.log\n"
+        "      # non-interactive merged log\n"
+        "  " << programName << " -s 4 -n 10 -i -d -o d2h_4g.log\n\n"
+        "Note: reading dmesg usually requires root:\n"
+        "  sudo ./test_d2h_debug -i -d -o merged.log\n";
 }
 
 static bool parseArguments(int argc, char** argv, Config& cfg)
@@ -199,6 +327,8 @@ static bool parseArguments(int argc, char** argv, Config& cfg)
             exit(EXIT_SUCCESS);
         } else if (strcmp(argv[i], "-i") == 0) {
             cfg.interactive = true;
+        } else if (strcmp(argv[i], "-d") == 0) {
+            cfg.captureDmesg = true;
         } else if (strcmp(argv[i], "-H") == 0) {
             cfg.showHostLayout = true;
         } else if (strcmp(argv[i], "-s") == 0) {
@@ -221,6 +351,12 @@ static bool parseArguments(int argc, char** argv, Config& cfg)
                 std::cerr << "Error: iterations must be positive\n";
                 return false;
             }
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: missing value for -o\n";
+                return false;
+            }
+            cfg.outputPath = argv[++i];
         } else {
             std::cerr << "Error: unknown option '" << argv[i] << "'\n";
             return false;
@@ -229,26 +365,42 @@ static bool parseArguments(int argc, char** argv, Config& cfg)
     return true;
 }
 
-static void stagePause(bool interactive, StageId id)
+static void stageBoundary(const Config& cfg, StageId id)
 {
-    if (!interactive) {
+    const StageInfo& stage = kStages[id];
+    const bool showBanner = cfg.interactive || cfg.captureDmesg;
+
+    if (!showBanner && !cfg.captureDmesg) {
         return;
     }
 
-    const StageInfo& stage = kStages[id];
-    std::cout << "\n========================================\n"
-              << "[STAGE:" << stage.name << "] (inspect dmesg, then continue)\n"
-              << "  Title   : " << stage.title << "\n"
-              << "  CUDA API: " << stage.cudaApi << "\n"
-              << "  dmesg   : " << stage.dmesgTags << "\n"
-              << "  Driver  : " << stage.driverBehavior << "\n"
-              << "========================================\n"
-              << "Press Enter to continue...";
-    std::cout.flush();
+    if (cfg.captureDmesg) {
+        printUserTimestamp();
+        dumpDmesgDelta();
+    }
 
-    if (getchar() == EOF) {
-        std::cerr << "stdin closed, exiting.\n";
-        exit(EXIT_FAILURE);
+    if (showBanner) {
+        std::cout << "\n========================================\n"
+                  << "[STAGE:" << stage.name << "]\n"
+                  << "  Title   : " << stage.title << "\n"
+                  << "  CUDA API: " << stage.cudaApi << "\n"
+                  << "  dmesg   : " << stage.dmesgTags << "\n"
+                  << "  Driver  : " << stage.driverBehavior << "\n"
+                  << "========================================\n";
+    }
+
+    if (cfg.captureDmesg) {
+        g_last_stage_name = stage.name;
+    }
+
+    if (cfg.interactive) {
+        std::cout << "Press Enter to continue...";
+        std::cout.flush();
+
+        if (getchar() == EOF) {
+            std::cerr << "stdin closed, exiting.\n";
+            exit(EXIT_FAILURE);
+        }
     }
 }
 
@@ -287,37 +439,58 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    std::ofstream logFile;
+    std::streambuf* coutBackup = nullptr;
+    TeeStreambuf* teeCout = nullptr;
+
+    if (cfg.outputPath != nullptr) {
+        logFile.open(cfg.outputPath, std::ios::out | std::ios::trunc);
+        if (!logFile.is_open()) {
+            std::cerr << "Error: cannot open output file '" << cfg.outputPath << "'\n";
+            return EXIT_FAILURE;
+        }
+        coutBackup = std::cout.rdbuf();
+        teeCout = new TeeStreambuf(coutBackup, logFile.rdbuf());
+        std::cout.rdbuf(teeCout);
+    }
+
+    if (cfg.captureDmesg) {
+        initDmesgCapture();
+    }
+
     size_t dataSize = static_cast<size_t>(cfg.dataSizeGB * (1LL << 30));
 
     std::cout << "D2H debug benchmark configuration:\n"
               << "  Data size    : " << cfg.dataSizeGB << " GB (" << dataSize << " bytes)\n"
               << "  Iterations   : " << cfg.numIterations << "\n"
               << "  Interactive  : " << (cfg.interactive ? "yes (-i)" : "no") << "\n"
+              << "  Dmesg capture: " << (cfg.captureDmesg ? "yes (-d)" : "no") << "\n"
+              << "  Output file  : " << (cfg.outputPath ? cfg.outputPath : "(stdout only)") << "\n"
               << "  Host layout  : " << (cfg.showHostLayout ? "yes (-H)" : "no") << "\n"
               << "  Memory type  : pinned host + device VRAM\n"
               << "  Direction    : Device -> Host\n";
 
-    stagePause(cfg.interactive, STAGE_INIT);
+    stageBoundary(cfg, STAGE_INIT);
 
     void* d_ptr = nullptr;
     CHECK_CUDA(cudaMalloc(&d_ptr, dataSize));
     std::cout << "d_ptr = " << d_ptr << "\n";
-    stagePause(cfg.interactive, STAGE_ALLOC_VRAM);
+    stageBoundary(cfg, STAGE_ALLOC_VRAM);
 
     void* h_ptr = nullptr;
     CHECK_CUDA(cudaMallocHost(&h_ptr, dataSize));
     std::cout << "h_ptr = " << h_ptr << "\n";
-    stagePause(cfg.interactive, STAGE_ALLOC_HOST);
+    stageBoundary(cfg, STAGE_ALLOC_HOST);
 
     CHECK_CUDA(cudaMemset(d_ptr, 0xAA, dataSize));
-    stagePause(cfg.interactive, STAGE_MEMSET);
+    stageBoundary(cfg, STAGE_MEMSET);
 
     CHECK_CUDA(cudaMemcpy(h_ptr, d_ptr, dataSize, cudaMemcpyDeviceToHost));
-    stagePause(cfg.interactive, STAGE_WARMUP);
+    stageBoundary(cfg, STAGE_WARMUP);
 
     if (cfg.showHostLayout) {
         printHostLayout(h_ptr, dataSize);
-        stagePause(cfg.interactive, STAGE_HOST_LAYOUT);
+        stageBoundary(cfg, STAGE_HOST_LAYOUT);
     }
 
     cudaEvent_t start, stop;
@@ -342,17 +515,28 @@ int main(int argc, char** argv)
               << "  Total data transferred: " << totalGB << " GB\n"
               << "  Total time: " << totalSeconds << " s\n"
               << "  Throughput: " << throughput << " GB/s\n";
-    stagePause(cfg.interactive, STAGE_BENCHMARK);
+    stageBoundary(cfg, STAGE_BENCHMARK);
 
     CHECK_CUDA(cudaFreeHost(h_ptr));
-    stagePause(cfg.interactive, STAGE_FREE_HOST);
+    stageBoundary(cfg, STAGE_FREE_HOST);
 
     CHECK_CUDA(cudaFree(d_ptr));
-    stagePause(cfg.interactive, STAGE_FREE_VRAM);
+    stageBoundary(cfg, STAGE_FREE_VRAM);
 
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 
-    stagePause(cfg.interactive, STAGE_DONE);
+    stageBoundary(cfg, STAGE_DONE);
+
+    if (cfg.captureDmesg) {
+        printUserTimestamp();
+        dumpDmesgDelta();
+    }
+
+    if (teeCout != nullptr) {
+        std::cout.rdbuf(coutBackup);
+        delete teeCout;
+    }
+
     return EXIT_SUCCESS;
 }
