@@ -135,6 +135,7 @@ struct Config {
     float dataSizeGB = 1.0f;
     int numIterations = 10;
     bool interactive = false;    // -i: pause after every stage
+    bool pauseBeforeBenchmark = false; // -p: pause before timed benchmark cudaMemcpy
     bool showHostLayout = false; // -H: print host VA/PA layout (va2pa)
     bool captureDmesg = false;   // -d: embed incremental dmesg at stage boundaries
     const char* outputPath = nullptr; // -o: tee merged log to file
@@ -300,6 +301,7 @@ static void printUsage(const char* programName)
         "  -s <GB>     Data size in GB (default: 1.0)\n"
         "  -n <count>  Timed D2H iterations (default: 10)\n"
         "  -i          Interactive: pause after every stage (default: no pause)\n"
+        "  -p          Pause before timed benchmark cudaMemcpy (after warmup)\n"
         "  -d          Capture full dmesg delta at each stage boundary\n"
         "  -o <file>   Tee merged user+dmesg output to file (works with -d)\n"
         "  -H          Print host VA/PA layout via /proc/self/pagemap (default: off)\n"
@@ -314,7 +316,9 @@ static void printUsage(const char* programName)
         "      # step through stages; dmesg merged inline (run with sudo)\n"
         "  " << programName << " -d -o merged.log\n"
         "      # non-interactive merged log\n"
-        "  " << programName << " -s 4 -n 10 -i -d -o d2h_4g.log\n\n"
+        "  " << programName << " -s 4 -n 10 -i -d -o d2h_4g.log\n"
+        "  " << programName << " -s 4 -d -p -o d2h_4g.log\n"
+        "      # pause before benchmark; align GPU trace with dmesg\n\n"
         "Note: reading dmesg usually requires root:\n"
         "  sudo ./test_d2h_debug -i -d -o merged.log\n";
 }
@@ -327,6 +331,8 @@ static bool parseArguments(int argc, char** argv, Config& cfg)
             exit(EXIT_SUCCESS);
         } else if (strcmp(argv[i], "-i") == 0) {
             cfg.interactive = true;
+        } else if (strcmp(argv[i], "-p") == 0) {
+            cfg.pauseBeforeBenchmark = true;
         } else if (strcmp(argv[i], "-d") == 0) {
             cfg.captureDmesg = true;
         } else if (strcmp(argv[i], "-H") == 0) {
@@ -363,6 +369,30 @@ static bool parseArguments(int argc, char** argv, Config& cfg)
         }
     }
     return true;
+}
+
+static void waitForUserContinue(const Config& cfg, const char* label,
+                                void* d_ptr, void* h_ptr, size_t dataSize)
+{
+    if (cfg.captureDmesg) {
+        printUserTimestamp();
+        dumpDmesgDelta();
+        g_last_stage_name = label;
+    }
+
+    std::cout << "\n========================================\n"
+              << "[PAUSE:" << label << "]\n"
+              << "  d_ptr = " << d_ptr << "\n"
+              << "  h_ptr = " << h_ptr << "\n"
+              << "  size  = " << dataSize << " bytes\n"
+              << "========================================\n"
+              << "Press Enter to start timed cudaMemcpy...";
+    std::cout.flush();
+
+    if (getchar() == EOF) {
+        std::cerr << "stdin closed, exiting.\n";
+        exit(EXIT_FAILURE);
+    }
 }
 
 static void stageBoundary(const Config& cfg, StageId id)
@@ -464,6 +494,7 @@ int main(int argc, char** argv)
               << "  Data size    : " << cfg.dataSizeGB << " GB (" << dataSize << " bytes)\n"
               << "  Iterations   : " << cfg.numIterations << "\n"
               << "  Interactive  : " << (cfg.interactive ? "yes (-i)" : "no") << "\n"
+              << "  Pause bench  : " << (cfg.pauseBeforeBenchmark ? "yes (-p)" : "no") << "\n"
               << "  Dmesg capture: " << (cfg.captureDmesg ? "yes (-d)" : "no") << "\n"
               << "  Output file  : " << (cfg.outputPath ? cfg.outputPath : "(stdout only)") << "\n"
               << "  Host layout  : " << (cfg.showHostLayout ? "yes (-H)" : "no") << "\n"
@@ -491,6 +522,10 @@ int main(int argc, char** argv)
     if (cfg.showHostLayout) {
         printHostLayout(h_ptr, dataSize);
         stageBoundary(cfg, STAGE_HOST_LAYOUT);
+    }
+
+    if (cfg.pauseBeforeBenchmark) {
+        waitForUserContinue(cfg, "before_benchmark", d_ptr, h_ptr, dataSize);
     }
 
     cudaEvent_t start, stop;
